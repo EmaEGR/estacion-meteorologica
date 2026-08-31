@@ -1,7 +1,9 @@
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include <Wire.h>
+
 #include <Adafruit_BMP280.h>
+
 
 
 // Definición de pines I2C secundarios para la Heltec V3
@@ -9,16 +11,17 @@
 #define SCL_2 42
 #define VEXT_PIN 36 // Pin de control de alimentación externa
 
+
 #define RF_FREQUENCY           915000000
-#define TX_OUTPUT_POWER        14
+#define TX_OUTPUT_POWER        20         // Potencia señal 22dBm máxima energia 14 normal -> 
 #define LORA_BANDWIDTH         0
-#define LORA_SPREADING_FACTOR  7
+#define LORA_SPREADING_FACTOR  7          // Modulacion de pulsos SF10 maxima
 #define LORA_CODINGRATE        1
 #define LORA_PREAMBLE_LENGTH   8
 
 #define MI_ID 1 // ID de este nodo
 
-const uint64_t TIEMPO_SLEEP = 60ULL; // tiempo descanso segundos : 120.000 mili segundos
+const uint64_t TIEMPO_SLEEP = 30ULL; // tiempo descanso
 
 struct __attribute__((__packed__)) TramaLoRa {
   uint8_t idDestino;
@@ -80,7 +83,7 @@ void setup() {
   Radio.SetSyncWord(0x12);
 
   // Armar paquete dirigido al Maestro (ID 0)
-  TramaLoRa txTrama;
+
   txTrama.idDestino = 0;      // Hacia el Maestro
   txTrama.idOrigen = MI_ID;   // Mi ID (1)
   txTrama.tipoMensaje = 2;    // Tipo de trama con datos
@@ -95,7 +98,7 @@ void loop() {
  Radio.IrqProcess();
 
   if (transmitido) {
-    Serial.println("Mensaje enviado modo sleep");
+    Serial.println("-- Mensaje enviado -> modo sleep");
     Radio.Sleep(); // Apago chip SX1262
     digitalWrite(VEXT_PIN,HIGH);  // Corto energia 
     
