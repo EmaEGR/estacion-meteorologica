@@ -1,7 +1,9 @@
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include <Wire.h>
+
 #include <Adafruit_BMP280.h>
+
 
 
 // Definición de pines I2C secundarios para la Heltec V3
@@ -9,16 +11,17 @@
 #define SCL_2 42
 #define VEXT_PIN 36 // Pin de control de alimentación externa
 
+
 #define RF_FREQUENCY           915000000
-#define TX_OUTPUT_POWER        14
+#define TX_OUTPUT_POWER        14         // Potencia señal 22dBm máxima energia 14 normal -> 
 #define LORA_BANDWIDTH         0
-#define LORA_SPREADING_FACTOR  7
+#define LORA_SPREADING_FACTOR  10         // Modulacion de pulsos SF10 maxima -> default 7
 #define LORA_CODINGRATE        1
 #define LORA_PREAMBLE_LENGTH   8
 
 #define MI_ID 1 // ID de este nodo
 
-const uint64_t TIEMPO_SLEEP = 60ULL; // tiempo descanso segundos : 120.000 mili segundos
+const uint64_t TIEMPO_SLEEP = 600ULL; // tiempo descanso
 
 struct __attribute__((__packed__)) TramaLoRa {
   uint8_t idDestino;
@@ -30,6 +33,9 @@ struct __attribute__((__packed__)) TramaLoRa {
 
 TramaLoRa rxTrama;
 TramaLoRa txTrama;
+
+float rssi = 0; // Nivel de Señal
+float snr = 0; // Relacion de señal/ruido
 
 bool transmitido = false;
 static RadioEvents_t RadioEvents;
@@ -79,13 +85,18 @@ void setup() {
   Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR, LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH, 0, false, 0, true, 0, 0, false, true);
   Radio.SetSyncWord(0x12);
 
+  //rssi = Radio.getRSSI();  // Nivel de Señal
+  //snr = Radio.getSNR(); // Relacion de señal/ruido
+
   // Armar paquete dirigido al Maestro (ID 0)
-  TramaLoRa txTrama;
+
   txTrama.idDestino = 0;      // Hacia el Maestro
   txTrama.idOrigen = MI_ID;   // Mi ID (1)
   txTrama.tipoMensaje = 2;    // Tipo de trama con datos
   txTrama.temperatura = sensor_temp.readTemperature()*10;  
-  txTrama.presionAtmosferica = 10;
+  txTrama.presionAtmosferica = sensor_temp.readPressure() / 100;
+
+
 
   // Envio mensaje 
   Radio.Send((uint8_t *)&txTrama, sizeof(TramaLoRa));
@@ -95,7 +106,10 @@ void loop() {
  Radio.IrqProcess();
 
   if (transmitido) {
-    Serial.println("Mensaje enviado modo sleep");
+    
+    Serial.println("-- Mensaje enviado -> modo sleep");
+    //Serial.printf("📡 [NODO 1] RSSI: %.1f dBm | SNR: %.2f dB\n", rssi, snr);
+    Serial.println("-- Mensaje enviado -> modo sleep");
     Radio.Sleep(); // Apago chip SX1262
     digitalWrite(VEXT_PIN,HIGH);  // Corto energia 
     
