@@ -2,24 +2,16 @@
 #include <ModbusRtu.h>
 #include "Arduino.h"
 #include <RadioLib.h>
-#include <PubSubClient.h>
+#include <PubSubClient.h> 
 #include <WiFi.h>
 
-// ============================================================
-//                 LoRa - RadioLib
-// ============================================================
+// ----------------- LoRa (RadioLib) -----------------
+#define HELTEC_CS   8
+#define HELTEC_DIO1 14     
+#define HELTEC_RST  12
+#define HELTEC_BUSY 13
 
-#define HELTEC_CS    8
-#define HELTEC_DIO1  14
-#define HELTEC_RST   12
-#define HELTEC_BUSY  13
-
-SX1262 radio = new Module(
-  HELTEC_CS,
-  HELTEC_DIO1,
-  HELTEC_RST,
-  HELTEC_BUSY
-);
+SX1262 radio = new Module(HELTEC_CS, HELTEC_DIO1, HELTEC_RST, HELTEC_BUSY);
 
 #define ID_MAESTRO 0
 
@@ -28,683 +20,313 @@ struct __attribute__((__packed__)) TramaLoRa {
   uint8_t idOrigen;
   uint8_t tipoMensaje;
   int16_t temperatura;
-  int16_t presionAtmosferica;
+  uint16_t presionAtmosferica;
 };
 
+// ------ WiFi & ThingsBoard Config --------
+#define WIFI_SSID           "FIBRA-WIFI6-5C8F"
+#define WIFI_PASSWORD       "wHaZmPZ9fMXeUXKemXSm"
 
-// ============================================================
-//                 WiFi & ThingsBoard
-// ============================================================
+//#define WIFI_SSID           "moto-g60"
+//#define WIFI_PASSWORD       "2942698428"
 
-#define WIFI_SSID     "Facu 2.4Ghz"
-#define WIFI_PASSWORD "43455675"
+#define TOKEN               "Ai9znLXyvFKz5CNorZfm"   // Token del Maestro
+#define THINGSBOARD_SERVER  "thingsboard.cloud"
 
-// Token del dispositivo Gateway en ThingsBoard
-#define TOKEN "YNvVq1msonEsK7zsFVRD"
-
-#define THINGSBOARD_SERVER "thingsboard.cloud"
-#define MQTT_PORT 1883
-
+// --- Objetos de Red ---
 WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+PubSubClient mqttClient(espClient); 
 
+// ----------------- Modbus RTU -----------------
+#define ID 1            // Dirección de Nodo Modbus
+#define PIN_POTE 7      // GPIO7
+#define PIN_LED 5       // GPIO5
+#define VEXT_PIN 36     // Control Vext Heltec
 
-// ============================================================
-//                 Modbus RTU
-// ============================================================
-
-#define ID 1
-
-#define PIN_POTE 7
-#define PIN_LED  5
-#define VEXT_PIN 36
-
-// UART2 para HMI Delta
-#define RX_DELTA 19
-#define TX_DELTA 20
+// Pines UART2 para la HMI Delta
+#define RX_DELTA 19     
+#define TX_DELTA 20     
 
 HardwareSerial SerialDelta(2);
 Modbus slave;
 
-
-// ============================================================
-//                 Control
-// ============================================================
-
 int AUTO = 0;
 int MAN = 1;
-
 int pump_relay = 10;
-
-
-// ============================================================
-//                 Variables
-// ============================================================
-
-unsigned long ultimoIntentoMQTT = 0;
-unsigned long ultimoIntentoWiFi = 0;
 
 float temp_lote1 = 0.0;
 float temp_lote2 = 0.0;
+float temp_promedio = 0.0;    
+int cant_Lotes = 4;
+
+uint16_t presion_lote1 = 0.0;
+uint16_t presion_lote2 = 0.0;
+
+// Banderas para sincronizar el envío a ThingsBoard desde el Core 1 hacia el Core 0
+volatile bool nuevoDatoNodo1 = false;
+volatile bool nuevoDatoNodo2 = false;
 
 volatile bool paquete_recibido = false;
-
 TramaLoRa mensaje;
 
+// Array para 10 registros Modbus
+#define cant_Registros 30
+uint16_t mapeo[cant_Registros] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-// ============================================================
-//                 Registros Modbus
-// ============================================================
-
-uint16_t mapeo[10] = {
-  0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0
-};
-
-
-// ============================================================
-//                 Interrupción LoRa
-// ============================================================
-
-void IRAM_ATTR mensajeRecibido() {
+void IRAM_ATTR mensajeRecibido(void) {
   paquete_recibido = true;
 }
 
-
-// ============================================================
-//                 SETUP
-// ============================================================
-
-void setup() {
-
-  Serial.begin(115200);
-
-  delay(1000);
-
-  Serial.println();
-  Serial.println("=================================");
-  Serial.println("     HELTEC - MAESTRO");
-  Serial.println("=================================");
-
-
-  // ----------------------------------------------------------
-  // Alimentación Vext
-  // ----------------------------------------------------------
-
-  pinMode(VEXT_PIN, OUTPUT);
-  digitalWrite(VEXT_PIN, LOW);
-
-  delay(100);
-
-
-  // ----------------------------------------------------------
-  // Salidas
-  // ----------------------------------------------------------
-
-  pinMode(pump_relay, OUTPUT);
-  digitalWrite(pump_relay, LOW);
-
-  pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, LOW);
-
-
-  // ----------------------------------------------------------
-  // WiFi
-  // ----------------------------------------------------------
-
+// TAREA EN SEGUNDO PLANO (Core 0): Gestión Total de Wi-Fi y ThingsBoard
+// ----------------------------------------------------------------------
+void tareaThingsBoard(void * pvParameters) {
   WiFi.mode(WIFI_STA);
-
-  Serial.println("Conectando a WiFi...");
-  Serial.print("SSID: ");
-  Serial.println(WIFI_SSID);
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  mqttClient.setServer(THINGSBOARD_SERVER, 1883);
+  mqttClient.setBufferSize(512);                               // NEW
 
-  ultimoIntentoWiFi = millis();
+  unsigned long ultimoIntentoMQTT = 0;
 
+  for (;;) {
+    // Conexión Wi-Fi / MQTT
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!mqttClient.connected()) {
+        unsigned long ahora = millis();
+        if (ahora - ultimoIntentoMQTT > 5000) {
+          ultimoIntentoMQTT = ahora;
+          Serial.print("[Core 0] Conectando a ThingsBoard...");
+          if (mqttClient.connect("Heltec_Maestro", TOKEN, NULL)) {
+            Serial.println(" CONECTADO!");
+          } else {
+            Serial.printf(" Falló (rc=%d)\n", mqttClient.state());
+          }
+        }
+      } else {
+        mqttClient.loop();
 
-  // ----------------------------------------------------------
-  // MQTT - ThingsBoard
-  // ----------------------------------------------------------
+        // Publicación Lote 1
+        if (nuevoDatoNodo1) {
+             nuevoDatoNodo1 = false;
+            char payload[200];
+            snprintf(payload, sizeof(payload), "{\"Nodo_Lote_1\": [{\"temperatura\": %.1f, \"presion\": %.1f}]}", temp_lote1, (float)presion_lote1);
+           
+            boolean publicado = mqttClient.publish("v1/gateway/telemetry", payload);
+            if (!publicado) {
+                Serial.println("Error: publish devolvió false (posible buffer chico)");
+            }
+        }
 
-  mqttClient.setServer(
-    THINGSBOARD_SERVER,
-    MQTT_PORT
-  );
-
-
-  // ----------------------------------------------------------
-  // LoRa
-  // ----------------------------------------------------------
-
-  Serial.println("Inicializando LoRa...");
-
-  int state = radio.begin(
-    915.0,     // Frecuencia
-    125.0,     // Bandwidth
-    7,         // Spreading Factor
-    5,         // Coding Rate
-    0x12,      // Sync Word
-    10         // Potencia
-  );
-
-  if (state == RADIOLIB_ERR_NONE) {
-
-    Serial.println("LoRa iniciado correctamente");
-    Serial.println("Frecuencia: 915 MHz");
-    Serial.println("Sync Word: 0x12");
-
-    radio.setDio1Action(mensajeRecibido);
-
-    radio.startReceive();
-
-  } else {
-
-    Serial.print("ERROR LoRa. Codigo: ");
-    Serial.println(state);
-
-    while (true) {
-      delay(1000);
+        // Publicación Lote 2
+        if (nuevoDatoNodo2) {
+          nuevoDatoNodo2 = false;
+          String p = "{\"Nodo_Lote_2\": [{\"temperatura\": " + String(temp_lote2, 1) + "}]}";
+          mqttClient.publish("v1/gateway/telemetry", (const uint8_t*)p.c_str(), p.length());
+        }
+      }
     }
+
+    // Retardo esencial para alimentar el Watchdog y ceder CPU a la pila de red
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
-
-
-  // ----------------------------------------------------------
-  // UART2 - HMI Delta
-  // ----------------------------------------------------------
-
-  SerialDelta.begin(
-    9600,
-    SERIAL_8N1,
-    RX_DELTA,
-    TX_DELTA
-  );
-
-  slave = Modbus(
-    ID,
-    SerialDelta,
-    0
-  );
-
-  slave.start();
-
-  Serial.println("Modbus RTU iniciado");
-  Serial.println("---------------------------------");
 }
 
 
-// ============================================================
-//                 LOOP
-// ============================================================
+void setup() {
+  Serial.begin(115200);
 
-void loop() {
+  // 1. Activar alimentación de periféricos (Vext)
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW); 
+  delay(100);
 
-
-  // ----------------------------------------------------------
-  // WiFi
-  // ----------------------------------------------------------
-
-  verificarConexionWiFi();
-
-
-  // ----------------------------------------------------------
-  // MQTT
-  // ----------------------------------------------------------
-
-  verificarConexionMQTT();
-
-  if (mqttClient.connected()) {
-    mqttClient.loop();
+  // 2. Inicializar Radio LoRa
+  int state = radio.begin(915.0, 125.0, 10, 5, 0x12, 10);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println(" MAESTRO LISTO (915 MHz, Sync 0x12)");
+    radio.setDio1Action(mensajeRecibido);
+    radio.startReceive();
+  } else {
+    Serial.println(" Error al iniciar radio LoRa");
+    while (true);
   }
 
+  // 3. Inicializar UART2 para HMI Delta y Modbus
+  SerialDelta.begin(115200, SERIAL_8N1, RX_DELTA, TX_DELTA);
+  slave = Modbus(ID, SerialDelta, 0); 
+  slave.start();
 
-  // ----------------------------------------------------------
-  // LoRa
-  // ----------------------------------------------------------
+  // 4. Designo tarea ThingsBoard / WIFI en el Core 0 
+  xTaskCreatePinnedToCore(
+    tareaThingsBoard,       /* Función de la tarea */
+    "Task_ThingsBoard",     /* Nombre */
+    8192,                   /* Tamaño del Stack */
+    NULL,                   /* Parámetro de entrada */
+    1,                      /* Prioridad */
+    NULL,                   /* Identificador de tarea */
+    0                       /* Asignado al NÚCLEO 0 */
+  );
 
+  Serial.println(" Sistema Maestro iniciado (HMI en Core 1 | Wi-Fi en Core 0)");
+}
+
+void loop() {
+  // -------------------------------------------------------------
+  // PRIORIDAD 1: Atender la consulta Modbus RTU de la pantalla Delta
+  // -------------------------------------------------------------
+  slave.poll(mapeo, cant_Registros);
+
+  // -------------------------------------------------------------
+  // PRIORIDAD 2: Procesar paquetes LoRa entrantes
+  // -------------------------------------------------------------
   if (paquete_recibido) {
-
     paquete_recibido = false;
-
-    int state = radio.readData(
-      (uint8_t*)&mensaje,
-      sizeof(TramaLoRa)
-    );
-
-
-    if (state == RADIOLIB_ERR_NONE) {
-
+    
+    int state = radio.readData((uint8_t*)&mensaje, sizeof(TramaLoRa));
+    float rssi = radio.getRSSI();  // Nivel de Señal
+    float snr = radio.getSNR(); // Relacion de señal/ruido
+    
+    if (state == RADIOLIB_ERR_NONE) { 
       if (mensaje.idDestino == ID_MAESTRO) {
-
-        float temperatura_calculada =
-          mensaje.temperatura / 10.0;
-
+        float temperatura_calculada = mensaje.temperatura / 10.0;
+        float presion_calculada = mensaje.presionAtmosferica;
 
         switch (mensaje.idOrigen) {
-
-
-          // ------------------------------------------------
-          // Nodo 1
-          // ------------------------------------------------
-
-          case 1:
-
+          case 1: {
             temp_lote1 = temperatura_calculada;
-
-            Serial.printf(
-              "-- Nodo 1 -- Temp: %.1f °C\n",
-              temp_lote1
-            );
-
-            enviarMensajeTB(
-              "Nodo_Lote_1",
-              temp_lote1
-            );
-
+            presion_lote1 = presion_calculada;
+            //Serial.printf("-- Paquete ESCLAVO 1 -- Temp: %.1f °C\n", temp_lote1);
+            Serial.printf("📡 [NODO 1] Temp: %.1f °C | Presion: %.1f °hPa | RSSI: %.1f dBm | SNR: %.2f dB\n", temp_lote1, presion_lote1, rssi, snr);
+            nuevoDatoNodo1 = true; // Notifica a la tarea del Core 0 para enviar por MQTT
             break;
-
-
-          // ------------------------------------------------
-          // Nodo 2
-          // ------------------------------------------------
-
-          case 2:
-
+          }
+          case 2: {
             temp_lote2 = temperatura_calculada;
-
-            Serial.printf(
-              "-- Nodo 2 -- Temp: %.1f °C\n",
-              temp_lote2
-            );
-
-            enviarMensajeTB(
-              "Nodo_Lote_2",
-              temp_lote2
-            );
-
+            presion_lote2 = 1000.0;
+            //Serial.printf("-- Paquete ESCLAVO 2 -- Temp: %.1f °C\n", temp_lote2);
+             Serial.printf("📡 [NODO 1] Temp: %.1f °C | RSSI: %.1f dBm | SNR: %.2f dB\n", temp_lote2, rssi, snr);
+            nuevoDatoNodo2 = true; // Notifica a la tarea del Core 0 para enviar por MQTT
             break;
-
-
+          }
           default:
-
-            Serial.print(
-              "ID de nodo desconocido: "
-            );
-
-            Serial.println(
-              mensaje.idOrigen
-            );
-
+            Serial.println(" ID de mensaje desconocido");
             break;
         }
       }
     }
 
-    else {
-
-      Serial.print(
-        "Error leyendo paquete LoRa: "
-      );
-
-      Serial.println(state);
-    }
-
-
-    // Volver a escuchar
+    // Volver a poner el radio en escucha
     radio.startReceive();
   }
 
-
-  // ----------------------------------------------------------
-  // HMI
-  // ----------------------------------------------------------
-
+  // -------------------------------------------------------------
+  // PRIORIDAD 3: Actualizar registros y lógica de control
+  // -------------------------------------------------------------
   updateHMI();
-
-
-  // ----------------------------------------------------------
-  // Modbus
-  // ----------------------------------------------------------
-
-  slave.poll(
-    mapeo,
-    10
-  );
 }
-
-
-// ============================================================
-//                 WiFi
-// ============================================================
-
-void verificarConexionWiFi() {
-
-  if (WiFi.status() == WL_CONNECTED) {
-
-    return;
-  }
-
-
-  unsigned long ahora = millis();
-
-
-  if (ahora - ultimoIntentoWiFi > 10000) {
-
-    ultimoIntentoWiFi = ahora;
-
-    Serial.println(
-      "WiFi desconectado. Intentando reconectar..."
-    );
-
-    WiFi.disconnect();
-    WiFi.begin(
-      WIFI_SSID,
-      WIFI_PASSWORD
-    );
-  }
-
-
-  static bool informado = false;
-
-  if (!informado) {
-
-    Serial.println(
-      "Esperando conexión WiFi..."
-    );
-
-    informado = true;
-  }
-}
-
-
-// ============================================================
-//                 MQTT - ThingsBoard
-// ============================================================
-
-void verificarConexionMQTT() {
-
-  // No intentar MQTT si no hay WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-
-  // Ya conectado
-  if (mqttClient.connected()) {
-    return;
-  }
-
-
-  unsigned long ahora = millis();
-
-
-  // Reintentar cada 5 segundos
-  if (ahora - ultimoIntentoMQTT > 5000) {
-
-    ultimoIntentoMQTT = ahora;
-
-    Serial.println();
-    Serial.println(
-      "Intentando conectar a ThingsBoard..."
-    );
-
-    Serial.print(
-      "Servidor: "
-    );
-
-    Serial.println(
-      THINGSBOARD_SERVER
-    );
-
-
-    if (
-      mqttClient.connect(
-        "Heltec_Maestro",
-        TOKEN,
-        NULL
-      )
-    ) {
-
-      Serial.println(
-        "ThingsBoard MQTT: CONECTADO"
-      );
-
-      Serial.println(
-        "Gateway listo para enviar telemetría"
-      );
-
-    }
-
-    else {
-
-      Serial.print(
-        "ThingsBoard MQTT: ERROR "
-      );
-
-      Serial.println(
-        mqttClient.state()
-      );
-    }
-  }
-}
-
-
-// ============================================================
-//                 Enviar a ThingsBoard
-// ============================================================
-
-void enviarMensajeTB(
-  String nombreNodo,
-  float temp
-) {
-
-  if (!mqttClient.connected()) {
-
-    Serial.println(
-      "MQTT desconectado. No se envia dato."
-    );
-
-    return;
-  }
-
-
-  // Formato Gateway API de ThingsBoard
-  String payload =
-    "{\"" +
-    nombreNodo +
-    "\":[{\"temperatura\":" +
-    String(temp, 1) +
-    "}]}";
-
-
-  Serial.print(
-    "ThingsBoard TX: "
-  );
-
-  Serial.println(
-    payload
-  );
-
-
-  bool enviado = mqttClient.publish(
-    "v1/gateway/telemetry",
-    (const uint8_t*)payload.c_str(),
-    payload.length()
-  );
-
-
-  if (enviado) {
-
-    Serial.println(
-      "ThingsBoard: dato enviado OK"
-    );
-
-  } else {
-
-    Serial.println(
-      "ThingsBoard: ERROR enviando dato"
-    );
-  }
-}
-
-
-// ============================================================
-//                 HMI
-// ============================================================
 
 void updateHMI() {
+  //Actualizacion promedio temperatura
+//  temp_promedio = (temp_lote1 + temp_lote2) /cant_Lotes;
+  temp_promedio = (int16_t)(presion_lote1 * 10);
+  mapeo[11] = temp_promedio;
+  // Asignación de temperatura a los registros Modbus
+  mapeo[7] = (int16_t)(presion_lote1 * 10);
+ 
+  mapeo[9] = (int16_t)(temp_lote1 * 10);
+  //Pruebas -> Carga de datos por pantalla 
+  temp_lote2 = mapeo[5];
+  presion_lote2 = mapeo[6];
 
-
-  // ----------------------------------------------------------
-  // Temperaturas
-  // ----------------------------------------------------------
-
-  mapeo[9] =
-    (int16_t)(temp_lote1 * 10);
-
-  mapeo[8] =
-    (int16_t)(temp_lote2 * 10);
-
-
-  // ----------------------------------------------------------
-  // Alarmas
-  // ----------------------------------------------------------
-
-  if (
-    temp_lote1 < -15 ||
-    temp_lote2 < -15
-  ) {
-
-    // ALARMA
-    bitWrite(mapeo[1], 3, 1);
-    bitWrite(mapeo[1], 4, 0);
-    bitWrite(mapeo[1], 5, 0);
-
+  // Evaluar condición de alarma
+  if (temp_lote1 < -15 || temp_lote2 < -15) { 
+    bitWrite(mapeo[4], 3, 1);
+    bitWrite(mapeo[4], 4, 0);
+    bitWrite(mapeo[4], 5, 0);
+  } else if ((temp_lote1 >= -15 && temp_lote1 < 0) || (temp_lote2 >= -15 && temp_lote2 < 0)) {
+    bitWrite(mapeo[4], 4, 1);
+    bitWrite(mapeo[4], 3, 0);
+    bitWrite(mapeo[4], 5, 0);
+  } else {
+    bitWrite(mapeo[4], 5, 1); 
+    bitWrite(mapeo[4], 4, 0);
+    bitWrite(mapeo[4], 3, 0);
   }
 
-  else if (
-    (temp_lote1 >= -15 && temp_lote1 < 0) ||
-    (temp_lote2 >= -15 && temp_lote2 < 0)
-  ) {
-
-    // ADVERTENCIA
-    bitWrite(mapeo[1], 4, 1);
-    bitWrite(mapeo[1], 3, 0);
-    bitWrite(mapeo[1], 5, 0);
-
-  }
-
-  else {
-
-    // NORMAL
-    bitWrite(mapeo[1], 5, 1);
-    bitWrite(mapeo[1], 4, 0);
-    bitWrite(mapeo[1], 3, 0);
-  }
-
-
-  // ----------------------------------------------------------
-  // AUTO / MANUAL
-  // ----------------------------------------------------------
-
+  // Actualización de Modo AUTO / MAN desde HMI
   if (bitRead(mapeo[0], 1)) {
-
-    AUTO = 1;
-    MAN = 0;
+    AUTO = 1; MAN = 0;
   }
-
-
   if (bitRead(mapeo[0], 2)) {
+    AUTO = 0; MAN = 1;
+  }
+  bitWrite(mapeo[3], 6, AUTO);
+  bitWrite(mapeo[3], 7, MAN);
 
-    AUTO = 0;
-    MAN = 1;
+  // Control de Bomba en AUTOMÁTICO
+  if ((temp_lote1 < -15 || temp_lote2 < -15) && AUTO) {
+    bitWrite(mapeo[3], 1, 1);
+    digitalWrite(pump_relay, HIGH);
+  } else if (AUTO) {
+    bitWrite(mapeo[3], 1, 0);
+    digitalWrite(pump_relay, LOW);
   }
 
-
-  bitWrite(
-    mapeo[1],
-    1,
-    AUTO
-  );
-
-  bitWrite(
-    mapeo[1],
-    2,
-    MAN
-  );
-
-
-  // ----------------------------------------------------------
-  // Bomba AUTOMÁTICA
-  // ----------------------------------------------------------
-
-  if (
-    (temp_lote1 < -15 ||
-     temp_lote2 < -15) &&
-    AUTO
-  ) {
-
-    bitWrite(
-      mapeo[0],
-      3,
-      1
-    );
-
-    digitalWrite(
-      pump_relay,
-      HIGH
-    );
-
-  }
-
-  else if (AUTO) {
-
-    bitWrite(
-      mapeo[0],
-      3,
-      0
-    );
-
-    digitalWrite(
-      pump_relay,
-      LOW
-    );
-  }
-
-
-  // ----------------------------------------------------------
-  // Bomba MANUAL
-  // ----------------------------------------------------------
-
+  // Control de Bomba en MANUAL
   if (MAN) {
-
-    if (bitRead(mapeo[0], 6)) {
-
-      bitWrite(
-        mapeo[0],
-        3,
-        1
-      );
-
-      digitalWrite(
-        pump_relay,
-        HIGH
-      );
+    if (bitRead(mapeo[0], 3)) {
+      bitWrite(mapeo[3], 1, 1);
+      digitalWrite(pump_relay, HIGH);
     }
-
-
     if (bitRead(mapeo[0], 4)) {
+      bitWrite(mapeo[3], 1, 0);
+      digitalWrite(pump_relay, LOW);
+    }
+  }
+  // Control VALVE XV-001
+  if (MAN) {
+    if (bitRead(mapeo[0], 6)) {
+      bitWrite(mapeo[3], 2, 1);
+      digitalWrite(pump_relay, HIGH);
+    }
+    if (bitRead(mapeo[0], 7)) {
+      bitWrite(mapeo[3], 2, 0);
+    //  digitalWrite(pump_relay, LOW);
+    }
+  }
 
-      bitWrite(
-        mapeo[0],
-        3,
-        0
-      );
+  // Control VALVE XV-002
+  if (MAN) {
+    if (bitRead(mapeo[0], 8)) {
+      bitWrite(mapeo[3], 3, 1);
+     // digitalWrite(pump_relay, HIGH);
+    }
+    if (bitRead(mapeo[0], 9)) {
+      bitWrite(mapeo[3], 3, 0);
+    //  digitalWrite(pump_relay, LOW);
+    }
+  }
 
-      digitalWrite(
-        pump_relay,
-        LOW
-      );
+  // Control VALVE XV-003
+  if (MAN) {
+    if (bitRead(mapeo[1], 0)) {
+      bitWrite(mapeo[3], 4, 1);
+      digitalWrite(pump_relay, HIGH);
+    }
+    if (bitRead(mapeo[1], 1)) {
+      bitWrite(mapeo[3], 4, 0);
+    //  digitalWrite(pump_relay, LOW);
+    }
+  }
+
+   // Control VALVE XV-004
+  if (MAN) {
+    if (bitRead(mapeo[1], 2)) {
+      bitWrite(mapeo[3], 5, 1);
+      digitalWrite(pump_relay, HIGH);
+    }
+    if (bitRead(mapeo[1], 3)) {
+      bitWrite(mapeo[3], 5, 0);
+     // digitalWrite(pump_relay, LOW);
     }
   }
 }
